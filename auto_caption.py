@@ -1,16 +1,21 @@
 import sys
 import io
+import re
 import json
 import subprocess
 from pathlib import Path
 from faster_whisper import WhisperModel
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+# ── 상수 ──────────────────────────────────────────────────────────────
+WHISPER_MODEL       = "medium"
+WHISPER_DEVICE      = "auto"
+WHISPER_COMPUTE     = "default"
+MAX_CHARS_PER_CHUNK = 10   # chunk_words() 기본 청크 크기
+# ──────────────────────────────────────────────────────────────────────
 
 
-def transcribe(audio_path: str) -> list[dict]:
-    model = WhisperModel("medium", device="auto", compute_type="default")
+def transcribe(audio_path: str, model: WhisperModel) -> list[dict]:
+    """Whisper로 단어별 타임스탬프를 추출한다."""
     segments, _ = model.transcribe(audio_path, word_timestamps=True)
 
     words = []
@@ -25,7 +30,8 @@ def transcribe(audio_path: str) -> list[dict]:
     return words
 
 
-def chunk_words(words: list[dict], max_chars: int = 10) -> list[dict]:
+def chunk_words(words: list[dict], max_chars: int = MAX_CHARS_PER_CHUNK) -> list[dict]:
+    """단어 목록을 max_chars 글자 단위로 청크로 묶는다."""
     chunks = []
     current_words = []
     current_len = 0
@@ -53,8 +59,15 @@ def chunk_words(words: list[dict], max_chars: int = 10) -> list[dict]:
     return chunks
 
 
+def _whisper_fallback(words: list[dict]) -> list[dict]:
+    """Claude 실패 시 Whisper 청크를 그대로 세그먼트로 반환한다."""
+    print("      → Whisper 원본 청크로 폴백합니다.", flush=True)
+    return chunk_words(words, max_chars=MAX_CHARS_PER_CHUNK)
+
+
 def ask_claude_for_segments(words: list[dict]) -> list[dict]:
-    chunks = chunk_words(words, max_chars=10)
+    """Claude에게 청크 데이터를 보내 자연스러운 자막 세그먼트로 재구성 요청한다."""
+    chunks = chunk_words(words, max_chars=MAX_CHARS_PER_CHUNK)
     chunks_json = json.dumps(chunks, ensure_ascii=False, indent=2)
 
     prompt = f"""아래는 오디오 자막을 10글자 단위로 미리 묶은 청크 데이터입니다.
@@ -77,26 +90,52 @@ def ask_claude_for_segments(words: list[dict]) -> list[dict]:
 청크 데이터:
 {chunks_json}"""
 
+    # 프롬프트를 CLI 인자가 아닌 stdin으로 전달 (OS 인자 길이 제한 방지)
     result = subprocess.run(
-        ["claude", "--print", prompt],
+        ["claude", "--print"],
+        input=prompt,
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Claude 호출 실패: {result.stderr}")
+        print(f"      ⚠ Claude 호출 실패 (returncode={result.returncode})", flush=True)
+        return _whisper_fallback(words)
 
     output = result.stdout.strip()
 
-    # JSON 블록 추출
-    if "```" in output:
-        start = output.find("```")
-        end = output.rfind("```")
-        output = output[start:end].strip()
-        output = output.lstrip("`json").lstrip("`").strip()
+    if not output:
+        print("      ⚠ Claude가 빈 응답을 반환했습니다.", flush=True)
+        return _whisper_fallback(words)
 
-    return json.loads(output)
+    # ── JSON 블록 추출 (정규식) ──────────────────────────────────────
+    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', output)
+    if match:
+        output = match.group(1)
+    else:
+        output = output.strip()
+    # ────────────────────────────────────────────────────────────────
+
+    try:
+        segments = json.loads(output)
+    except json.JSONDecodeError:
+        print("      ⚠ Claude 응답이 JSON이 아닙니다 (거절 또는 형식 오류).", flush=True)
+        return _whisper_fallback(words)
+
+    # ── Claude 응답 JSON 구조 검증 ───────────────────────────────────
+    required_keys = {"start", "end", "text"}
+    for i, seg in enumerate(segments):
+        missing = required_keys - set(seg.keys())
+        if missing:
+            print(f"      ⚠ 세그먼트[{i}] 구조 오류: {missing}", flush=True)
+            return _whisper_fallback(words)
+        if not isinstance(seg["start"], (int, float)) or not isinstance(seg["end"], (int, float)):
+            print(f"      ⚠ 세그먼트[{i}] 타입 오류", flush=True)
+            return _whisper_fallback(words)
+    # ────────────────────────────────────────────────────────────────
+
+    return segments
 
 
 def format_time(seconds: float) -> str:
@@ -108,7 +147,6 @@ def format_time(seconds: float) -> str:
 
 
 def split_by_sentence(segments: list[dict]) -> list[dict]:
-    import re
     result = []
     for seg in segments:
         # 문장 끝 기호 뒤에서 분리 (기호는 앞 문장에 포함)
@@ -146,8 +184,11 @@ def main():
     audio_path = sys.argv[1]
     output_path = Path(audio_path).with_suffix(".srt")
 
-    print(f"[1/3] Whisper로 타임스탬프 추출 중... ({audio_path})")
-    words = transcribe(audio_path)
+    print(f"[1/3] Whisper 모델 로드 중... (모델: {WHISPER_MODEL})")
+    model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+
+    print(f"      Whisper로 타임스탬프 추출 중... ({audio_path})")
+    words = transcribe(audio_path, model)
     print(f"      → {len(words)}개 단어 추출 완료")
 
     print("[2/3] Claude에게 문맥 기반 줄바꿈 요청 중...")
@@ -163,4 +204,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # stdout/stderr 인코딩을 UTF-8로 고정 (모듈 import 시 부작용 방지)
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
     main()
